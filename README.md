@@ -13,6 +13,7 @@ A PowerShell script to automatically configure and fix network discovery and fil
 
 ## Usage
 
+### Local Execution
 1. Download the script
 2. Right-click `fix-windows-share.ps1` and select "Run with PowerShell"
    - Or run from PowerShell with elevated privileges:
@@ -23,6 +24,18 @@ A PowerShell script to automatically configure and fix network discovery and fil
      ```powershell
      .\fix-windows-share.ps1 -Debug
      ```
+
+### Remote Execution
+Run directly from GitHub (requires elevated PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/fl4pj4ck/fix-windows-share/main/fix-windows-share.ps1 | iex
+```
+
+With debug output:
+```powershell
+$script = irm https://raw.githubusercontent.com/fl4pj4ck/fix-windows-share/main/fix-windows-share.ps1
+& ([scriptblock]::Create($script)) -Debug
+```
 
 ## What it fixes
 
