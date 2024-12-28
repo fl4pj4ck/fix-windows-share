@@ -898,31 +898,43 @@ function Enable-WindowsFeatures {
     Write-SubStep "Configuring Windows features..."
 
     try {
-        if ($activeConfig.Features.Count -gt 0) {
-            foreach ($feature in $activeConfig.Features) {
-                try {
-                    $state = Get-WindowsOptionalFeature -Online -FeatureName $feature
-                    if ($state.State -ne "Enabled") {
-                        Enable-WindowsOptionalFeature -Online -FeatureName $feature -NoRestart | Out-Null
-                        Write-Success "Enabled feature: $feature"
-                    } else {
-                        Write-Success "Feature already enabled: $feature"
-                    }
-                } catch {
+        # Use DISM instead of PowerShell commands
+        $features = @(
+            'NetFx3',
+            'SMB1Protocol',
+            'SmbDirect',
+            'Microsoft-Windows-GroupPolicy-ClientTools-Package'
+        )
+
+        foreach ($feature in $features) {
+            Write-SubStep "Enabling feature: $feature"
+
+            # Check if feature exists first
+            $checkResult = cmd /c "DISM /Online /Get-FeatureInfo /FeatureName:$feature" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $result = cmd /c "DISM /Online /Enable-Feature /FeatureName:$feature /Quiet /NoRestart" 2>&1
+                if ($LASTEXITCODE -ne 0) {
                     Add-StepResult -Step $currentStep `
-                                  -Component $feature `
-                                  -Message ("Failed to enable: {0}" -f $_.Exception.Message) `
-                                  -Type 'Warning'
+                                 -Component $feature `
+                                 -Message "Failed to enable: $result" `
+                                 -Type 'Warning'
                 }
+            } else {
+                Add-StepResult -Step $currentStep `
+                             -Component $feature `
+                             -Message "Feature not available on this system" `
+                             -Type 'Warning'
             }
-        } else {
-            Write-Success "No additional features required for this Windows version"
         }
-    } catch {
+
+        return $true
+    }
+    catch {
         Add-StepResult -Step $currentStep `
                       -Component "Feature Management" `
                       -Message ("Failed to configure Windows features: {0}" -f $_.Exception.Message) `
-                      -Type 'Critical'
+                      -Type 'Warning'
+        return $false
     }
 }
 
@@ -1385,29 +1397,33 @@ function Set-ServiceConfig {
     )
 
     try {
-        $service = Get-Service -Name $ServiceName -ErrorAction Stop
-
-        # Try to modify service using sc.exe instead of Set-Service
-        if ($service.StartType -ne $StartupType) {
-            $result = cmd /c "sc.exe config $ServiceName start= $($StartupType.ToLower())" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-CustomWarning "Service '$DisplayName' cannot be configured: $result"
-                return $false
+        # Try using sc.exe first
+        $result = cmd /c "sc.exe config $ServiceName start= $($StartupType.ToLower())" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # If sc.exe fails, try using reg.exe
+            $regPath = "HKLM\System\CurrentControlSet\Services\$ServiceName"
+            $startValue = switch ($StartupType.ToLower()) {
+                'automatic' { 2 }
+                'manual' { 3 }
+                'disabled' { 4 }
+                default { 2 }
             }
+            $result = cmd /c "reg.exe add `"$regPath`" /v Start /t REG_DWORD /d $startValue /f" 2>&1
         }
 
-        if ($Start -and $service.Status -ne 'Running') {
+        if ($Start) {
+            # Try net start first
             $result = cmd /c "net start $ServiceName" 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-CustomWarning "Service '$DisplayName' cannot be started: $result"
-                return $false
+                # If net start fails, try sc.exe start
+                $result = cmd /c "sc.exe start $ServiceName" 2>&1
             }
         }
 
         return $true
     }
     catch {
-        Write-CustomWarning "Service '$DisplayName' configuration failed: $($_.Exception.Message)"
+        Write-CustomWarning ("Service '{0}' configuration failed: {1}" -f $DisplayName, $_.Exception.Message)
         return $false
     }
 }
@@ -1422,19 +1438,25 @@ function Set-NetworkBinding {
     )
 
     try {
-        # Use netsh instead of Get-NetAdapterBinding
-        if ($Enable) {
-            $result = cmd /c "netsh interface ipv4 set interface `"$AdapterName`" component=$ComponentID enable" 2>&1
-        } else {
-            $result = cmd /c "netsh interface ipv4 set interface `"$AdapterName`" component=$ComponentID disable" 2>&1
+        # First try using netsh interface ipv4
+        $action = if ($Enable) { "enable" } else { "disable" }
+        $result = cmd /c "netsh interface ipv4 set interface `"$AdapterName`" $action" 2>&1
+
+        if ($LASTEXITCODE -ne 0) {
+            # If that fails, try using netsh interface set interface
+            $result = cmd /c "netsh interface set interface `"$AdapterName`" $action" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-CustomWarning ("Failed to configure {0} on adapter {1}" -f $DisplayName, $AdapterName)
+                return $false
+            }
         }
 
-        if ($LASTEXITCODE -eq 0) {
-            return $true
+        # Try to enable specific components if needed
+        if ($ComponentID -match "^(TCPIP|TCPIP6|DNSClient|DHCP)$") {
+            $result = cmd /c "netsh interface $ComponentID set interface `"$AdapterName`" $action" 2>&1
         }
 
-        Write-CustomWarning ("Failed to configure {0} on adapter {1}" -f $DisplayName, $AdapterName)
-        return $false
+        return $true
     }
     catch {
         Write-CustomWarning ("Error configuring {0}: {1}" -f $DisplayName, $_.Exception.Message)
@@ -1535,6 +1557,54 @@ function Enable-FileSharing {
                       -Component "File and Printer Sharing" `
                       -Message ("Failed to configure: {0}" -f $_.Exception.Message) `
                       -Type 'Critical'
+    }
+}
+
+function Set-NetworkAdapterConfig {
+    [CmdletBinding()]
+    param(
+        [string]$AdapterName
+    )
+
+    $currentStep = "Network Adapter Configuration"
+    Write-SubStep "Configuring adapter: $AdapterName"
+
+    try {
+        # Enable adapter first
+        $result = cmd /c "netsh interface set interface `"$AdapterName`" admin=enable" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Add-StepResult -Step $currentStep `
+                          -Component $AdapterName `
+                          -Message "Failed to enable adapter" `
+                          -Type 'Warning'
+            return $false
+        }
+
+        # Configure basic settings
+        $commands = @(
+            @{ cmd = "netsh interface ipv4 set interface `"$AdapterName`" forwarding=enabled"; desc = "IPv4 Forwarding" },
+            @{ cmd = "netsh interface ipv4 set interface `"$AdapterName`" advertise=enabled"; desc = "Router Advertisement" },
+            @{ cmd = "netsh interface ipv4 set interface `"$AdapterName`" mtu=1500"; desc = "MTU Setting" }
+        )
+
+        foreach ($command in $commands) {
+            $result = cmd /c $command.cmd 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Add-StepResult -Step $currentStep `
+                              -Component $command.desc `
+                              -Message "Failed to configure on $AdapterName" `
+                              -Type 'Warning'
+            }
+        }
+
+        return $true
+    }
+    catch {
+        Add-StepResult -Step $currentStep `
+                      -Component $AdapterName `
+                      -Message ("Configuration failed: {0}" -f $_.Exception.Message) `
+                      -Type 'Warning'
+        return $false
     }
 }
 
