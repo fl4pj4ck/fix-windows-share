@@ -6,60 +6,50 @@ A PowerShell script to automatically configure and fix network discovery and fil
 
 - Configures network discovery and file sharing
 - Supports both Windows 10 and 11
-- Works with Home and Pro editions
-- Automatically fixes common networking issues
+- Handles Home and Pro editions
+- Optimizes network adapter settings
 - Resets network stack when needed
-- Provides detailed logging and debug options
-
-## Usage
-
-### Local Execution
-1. Download the script
-2. Right-click `fix-windows-share.ps1` and select "Run with PowerShell"
-   - Or run from PowerShell with elevated privileges:
-     ```powershell
-     .\fix-windows-share.ps1
-     ```
-   - For debug output:
-     ```powershell
-     .\fix-windows-share.ps1 -Debug
-     ```
-
-### Remote Execution
-Run directly from GitHub (requires elevated PowerShell):
-```powershell
-irm https://raw.githubusercontent.com/fl4pj4ck/fix-windows-share/main/fix-windows-share.ps1 | iex
-```
-
-With debug output:
-```powershell
-$script = irm https://raw.githubusercontent.com/fl4pj4ck/fix-windows-share/main/fix-windows-share.ps1
-& ([scriptblock]::Create($script)) -Debug
-```
-
-## What it fixes
-
-- Network discovery settings
-- File and printer sharing
-- Required Windows services
-- Network protocols and bindings
-- Firewall rules
-- Network stack issues
-- TCP/IP optimization
-- SMB configuration
+- Provides detailed logging and diagnostics
 
 ## Requirements
 
-- Windows 10 or 11 (Home or Pro)
+- Windows 10/11
 - PowerShell 5.0 or higher
 - Administrative privileges
 
+## Usage
+
+1. Right-click `fix-windows-share.ps1` and select "Run with PowerShell"
+   - Or open PowerShell as Administrator and run:
+   ```powershell
+   .\fix-windows-share.ps1
+   ```
+
+2. For detailed debug output:
+   ```powershell
+   .\fix-windows-share.ps1 -Debug
+   ```
+
+## What it Does
+
+1. Configures network discovery services
+2. Sets network profiles to Private
+3. Enables required protocols
+4. Optimizes network adapter settings
+5. Configures file and printer sharing
+6. Resets network stack if needed
+7. Applies recommended security settings
+
 ## Logs
 
-The script creates log files in your temp directory:
-- Debug log: `%TEMP%\NetworkConfig_Debug.log`
-- Execution log: `%TEMP%\NetworkConfig_*.log`
+Logs are stored in:
+- `%TEMP%\NetworkConfig_Debug.log` (Debug log)
+- `%TEMP%\NetworkConfig_[timestamp].log` (Session log)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file
+MIT License - See LICENSE file for details
+
+## Contributing
+
+Pull requests welcome! Please read CONTRIBUTING.md first.

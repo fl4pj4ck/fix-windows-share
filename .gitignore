@@ -1,16 +1,19 @@
-# PowerShell logs
-*.log
+# PowerShell
+*.ps1xml
+*.psm1
+*.psd1
+*.ps1.test
 
-# Windows system files
+# Windows
 Thumbs.db
 desktop.ini
 
-# IDE files
+# Logs
+*.log
+
+# VS Code
 .vscode/
-.idea/
-*.suo
-*.user
-*.sln.docstates
+*.code-workspace
 
 # Temp files
 *.tmp

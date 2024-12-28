@@ -613,56 +613,80 @@ function Enable-RequiredProtocols {
     $currentStep = "Network Protocols"
     Write-SubStep "Configuring required network protocols..."
 
-    # Get all network adapters first
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+    # Get physical network adapters only
+    $adapters = Get-NetAdapter | Where-Object {
+        $_.Status -eq 'Up' -and
+        # Only include physical adapters
+        $_.InterfaceType -eq 6 -and  # 6 = Ethernet
+        # Additional filtering for virtual adapters
+        -not ($_.Name -like "*Virtual*" -or
+              $_.Name -like "*WSL*" -or
+              $_.Name -like "*Loopback*" -or
+              $_.Name -like "*Bluetooth*" -or
+              $_.Name -like "*vEthernet*" -or
+              $_.HardwareInterface -eq $false)
+    }
 
     if (-not $adapters) {
         Add-StepResult -Step $currentStep `
                       -Component "Network Adapters" `
-                      -Message "No active network adapters found" `
+                      -Message "No physical network adapters found" `
                       -Type 'Warning'
         return
     }
 
     foreach ($adapter in $adapters) {
-        Write-SubStep "Configuring adapter: $($adapter.Name)"
+        Write-SubStep "Configuring physical adapter: $($adapter.Name)"
 
-        # Configure basic adapter settings and protocols in one pass
-        $success = $true
+        # Basic adapter configuration with improved error handling
+        try {
+            # Enable adapter and verify status
+            $result = cmd /c "netsh interface set interface `"$($adapter.Name)`" admin=enable" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Enabled adapter: $($adapter.Name)"
 
-        # Basic adapter configuration
-        $result = cmd /c "netsh interface set interface `"$($adapter.Name)`" admin=enable" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $success = $false
-            Add-StepResult -Step $currentStep `
-                          -Component $adapter.Name `
-                          -Message "Failed to enable adapter" `
-                          -Type 'Warning'
-        }
+                # Configure advanced adapter settings
+                $advancedSettings = @(
+                    @{ setting = "Speed & Duplex"; value = "Auto Negotiation" },
+                    @{ setting = "Energy Efficient Ethernet"; value = "Disabled" },
+                    @{ setting = "Flow Control"; value = "Rx & Tx Enabled" }
+                )
 
-        # Configure protocols in one pass
-        $protocols = @(
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" forwarding=enabled"; desc = "IPv4 Forwarding" },
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" advertise=enabled"; desc = "Router Advertisement" },
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" mtu=1500"; desc = "MTU Setting" },
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=IPv4-TCPIP enable"; desc = "TCP/IP" },
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=MS_MSCLIENT enable"; desc = "Client for Microsoft Networks" },
-            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=MS_SERVER enable"; desc = "File and Printer Sharing" }
-        )
+                foreach ($setting in $advancedSettings) {
+                    try {
+                        $property = Get-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName $setting.setting -ErrorAction SilentlyContinue
+                        if ($property) {
+                            Set-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName $setting.setting -DisplayValue $setting.value -ErrorAction SilentlyContinue
+                            Write-Success "Configured $($setting.setting) on $($adapter.Name)"
+                        }
+                    } catch {
+                        Write-DebugLog "Advanced setting $($setting.setting) not supported on $($adapter.Name)"
+                    }
+                }
 
-        foreach ($protocol in $protocols) {
-            $result = cmd /c $protocol.cmd 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                $success = $false
-                Add-StepResult -Step $currentStep `
-                              -Component $protocol.desc `
-                              -Message "Failed to configure on $($adapter.Name)" `
-                              -Type 'Warning'
+                # Configure basic protocols
+                $protocols = @(
+                    @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" forwarding=enabled"; desc = "IPv4 Forwarding" },
+                    @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" mtu=1500"; desc = "MTU Setting" }
+                )
+
+                foreach ($protocol in $protocols) {
+                    try {
+                        $result = cmd /c $protocol.cmd 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Success "Configured $($protocol.desc) on $($adapter.Name)"
+                        } else {
+                            Write-DebugLog "Failed to configure $($protocol.desc) on $($adapter.Name): $result"
+                        }
+                    } catch {
+                        Write-DebugLog "Error configuring $($protocol.desc) on $($adapter.Name): $($_.Exception.Message)"
+                    }
+                }
             }
+        } catch {
+            Write-DebugLog "Failed to configure adapter $($adapter.Name): $($_.Exception.Message)"
+            continue
         }
-
-        # Remove the Write-Host and just track success silently
-        $success | Out-Null
     }
 }
 
@@ -1218,7 +1242,17 @@ function Reset-NetworkStack {
 
         Write-DebugLog "Initialized variables"
 
-        # Define commands array inside the function
+        # Get physical adapters only
+        $physicalAdapters = Get-NetAdapter | Where-Object {
+            $_.Status -eq 'Up' -and
+            $_.InterfaceType -eq 6 -and  # 6 = Ethernet
+            -not ($_.Name -like "*Virtual*" -or
+                  $_.Name -like "*WSL*" -or
+                  $_.Name -like "*vEthernet*" -or
+                  $_.HardwareInterface -eq $false)
+        }
+
+        # Define commands array with adapter-specific commands
         [array]$networkCommands = @(
             @{
                 name = "DNS Cache Flush"
@@ -1231,19 +1265,29 @@ function Reset-NetworkStack {
                 cmd = "ipconfig /registerdns"
                 critical = $false
                 requiresReboot = $false
-            },
-            @{
-                name = "IP Release"
-                cmd = "ipconfig /release"
-                critical = $false
-                requiresReboot = $false
-            },
-            @{
-                name = "IP Renew"
-                cmd = "ipconfig /renew"
-                critical = $false
-                requiresReboot = $false
-            },
+            }
+        )
+
+        # Add IP release/renew commands only for physical adapters
+        foreach ($adapter in $physicalAdapters) {
+            $networkCommands += @(
+                @{
+                    name = "IP Release - $($adapter.Name)"
+                    cmd = "ipconfig /release `"$($adapter.Name)`""
+                    critical = $false
+                    requiresReboot = $false
+                },
+                @{
+                    name = "IP Renew - $($adapter.Name)"
+                    cmd = "ipconfig /renew `"$($adapter.Name)`""
+                    critical = $false
+                    requiresReboot = $false
+                }
+            )
+        }
+
+        # Add final reset commands
+        $networkCommands += @(
             @{
                 name = "Winsock Reset"
                 cmd = "netsh winsock reset"
@@ -1258,7 +1302,7 @@ function Reset-NetworkStack {
             }
         )
 
-        Write-DebugLog "Network commands array defined"
+        Write-DebugLog "Network commands array defined with $(($networkCommands | Measure-Object).Count) commands"
 
         foreach ($command in $networkCommands) {
             Write-DebugLog "Processing command: $($command.name)"
@@ -1275,8 +1319,14 @@ function Reset-NetworkStack {
                 $cmdExitCode = $global:LASTEXITCODE
                 Write-DebugLog "Command exit code: $cmdExitCode"
 
+                # Consider command successful if exit code is 0 or output contains success messages
                 if ($cmdExitCode -eq 0 -or
-                    $output -match "completed successfully|OK|Command completed|processed|reset catalog") {
+                    $output -match "completed successfully|OK|Command completed|processed|reset catalog" -and
+                    $output -notmatch "failed|error|denied" -or
+                    # Special case for IP operations that might partially succeed
+                    ($command.name -match "IP (Release|Renew)" -and
+                     $output -match "IPv4 Address|Default Gateway")) {
+
                     Write-Success "$($command.name) completed successfully"
                     Write-DebugLog "$($command.name) completed successfully"
 
@@ -1305,12 +1355,11 @@ function Reset-NetworkStack {
                 Write-DebugLog "Exception caught: $errorMsg"
                 Write-DebugLog "Stack trace: $($_.ScriptStackTrace)"
 
-                Add-StepResult -Step $currentStep `
-                              -Component $command.name `
-                              -Message ("Failed: {0}" -f $errorMsg) `
-                              -Type $(if ($command.critical) { 'Critical' } else { 'Warning' })
-
                 if ($command.critical) {
+                    Add-StepResult -Step $currentStep `
+                                  -Component $command.name `
+                                  -Message ("Failed: {0}" -f $errorMsg) `
+                                  -Type 'Critical'
                     $criticalFailures = $true
                     $success = $false
                     Write-DebugLog "Critical failure in catch block"
@@ -1325,7 +1374,6 @@ function Reset-NetworkStack {
         Write-DebugLog "Success status: $success"
 
         if ($criticalFailures) {
-            Write-DebugLog "Adding critical failure result"
             Add-StepResult -Step $currentStep `
                           -Component "Network Stack" `
                           -Message "One or more critical network stack operations failed" `
@@ -1334,14 +1382,12 @@ function Reset-NetworkStack {
         }
 
         if ($criticalChanges) {
-            Write-DebugLog "Adding warning about restart requirement"
             Add-StepResult -Step $currentStep `
                           -Component "Network Stack" `
                           -Message "Network stack changes require a system restart" `
                           -Type 'Warning'
         }
 
-        Write-DebugLog "Returning success status: $success"
         return $success
     }
     catch {
