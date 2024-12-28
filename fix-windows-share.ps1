@@ -33,6 +33,14 @@ param(
     [switch]$Debug
 )
 
+# Replace the process check with a simpler version
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+$processes = Get-Process | Where-Object { $_.ProcessName -like "*powershell*" -and $_.CommandLine -like "*$scriptName*" }
+if ($processes.Count -gt 2) {
+    Write-Warning "Script is already running in another window"
+    return
+}
+
 # Pause function
 function Pause {
     Write-Host "`nPress Enter to continue..." -ForegroundColor Yellow -NoNewline
@@ -606,38 +614,55 @@ function Enable-RequiredProtocols {
     Write-SubStep "Configuring required network protocols..."
 
     # Get all network adapters first
-    $adapters = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' }
+    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
 
     if (-not $adapters) {
         Add-StepResult -Step $currentStep `
                       -Component "Network Adapters" `
                       -Message "No active network adapters found" `
                       -Type 'Warning'
-        Write-CustomWarning "No active network adapters found"
         return
     }
 
     foreach ($adapter in $adapters) {
-        Write-SubStep "Configuring protocols for adapter: $($adapter.Name)"
+        Write-SubStep "Configuring adapter: $($adapter.Name)"
 
-        # Correct component IDs for network bindings
-        $components = @(
-            @{ ID = "ms_tcpip"; Name = "IPv4" },
-            @{ ID = "ms_tcpip6"; Name = "IPv6" },
-            @{ ID = "ms_msclient"; Name = "Client for Microsoft Networks" },
-            @{ ID = "ms_server"; Name = "File and Printer Sharing" },
-            @{ ID = "ms_rspndr"; Name = "Link-Layer Topology Discovery Responder" },
-            @{ ID = "ms_lltdio"; Name = "Link-Layer Topology Discovery Mapper I/O Driver" }
+        # Configure basic adapter settings and protocols in one pass
+        $success = $true
+
+        # Basic adapter configuration
+        $result = cmd /c "netsh interface set interface `"$($adapter.Name)`" admin=enable" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $success = $false
+            Add-StepResult -Step $currentStep `
+                          -Component $adapter.Name `
+                          -Message "Failed to enable adapter" `
+                          -Type 'Warning'
+        }
+
+        # Configure protocols in one pass
+        $protocols = @(
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" forwarding=enabled"; desc = "IPv4 Forwarding" },
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" advertise=enabled"; desc = "Router Advertisement" },
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" mtu=1500"; desc = "MTU Setting" },
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=IPv4-TCPIP enable"; desc = "TCP/IP" },
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=MS_MSCLIENT enable"; desc = "Client for Microsoft Networks" },
+            @{ cmd = "netsh interface ipv4 set interface `"$($adapter.Name)`" component=MS_SERVER enable"; desc = "File and Printer Sharing" }
         )
 
-        foreach ($component in $components) {
-            if (-not (Set-NetworkBinding -AdapterName $adapter.Name -ComponentID $component.ID -DisplayName $component.Name -Enable $true)) {
+        foreach ($protocol in $protocols) {
+            $result = cmd /c $protocol.cmd 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $success = $false
                 Add-StepResult -Step $currentStep `
-                              -Component $component.Name `
-                              -Message "Failed to configure on adapter $($adapter.Name)" `
+                              -Component $protocol.desc `
+                              -Message "Failed to configure on $($adapter.Name)" `
                               -Type 'Warning'
             }
         }
+
+        # Remove the Write-Host and just track success silently
+        $success | Out-Null
     }
 }
 
@@ -692,54 +717,92 @@ function Enable-NetworkOptimization {
 
     $currentStep = "Network Optimization"
     Write-SubStep "Optimizing network performance..."
+    Write-DebugLog "Starting network optimization"
 
     try {
-        # Configure TCP/IP parameters
-        $tcpParams = @{
-            "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" = @{
-                "EnableConnectionRateLimiting" = 0
-                "EnableDCA" = 1
-                "EnablePMTUDiscovery" = 1
-                "EnableWsd" = 1
-                "GlobalMaxTcpWindowSize" = 65535
-                "Tcp1323Opts" = 1
-                "TcpMaxDupAcks" = 2
-                "SackOpts" = 1
-            }
-            "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" = @{
-                "DisabledComponents" = 0x20  # Prefer IPv4 over IPv6
-                "EnableICSIPv6" = 0         # Disable IPv6 Internet Connection Sharing
-            }
-        }
+        # Get all network adapters first
+        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
 
-        foreach ($path in $tcpParams.Keys) {
-            foreach ($name in $tcpParams[$path].Keys) {
-                try {
-                    if (!(Test-Path $path)) {
-                        New-Item -Path $path -Force | Out-Null
-                        Write-Success "Created registry path: $path"
-                    }
+        foreach ($adapter in $adapters) {
+            Write-SubStep "Configuring adapter: $($adapter.Name)"
 
-                    $comparison = Compare-Setting -Path $path -Name $name -DesiredValue $tcpParams[$path][$name]
-                    if ($comparison.Changed) {
-                        Set-ItemProperty -Path $path -Name $name -Value $tcpParams[$path][$name] -Type DWord -Force
-                        Write-Success "Updated: $name ($($comparison.Message))"
-                    } else {
-                        Write-CustomWarning "Skipped: $name ($($comparison.Message))"
+            # Try to enable RSS if supported
+            try {
+                # Check if RSS is supported before attempting to get/set
+                $rssSupported = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
+                              Where-Object { $_.RegistryKeyword -like "*RSS*" -or $_.DisplayName -like "*Receive Side Scaling*" }
+
+                if ($rssSupported) {
+                    $rssParams = @{
+                        Name = $adapter.Name
+                        BaseProcessorNumber = 2
+                        MaxProcessorNumber = [System.Environment]::ProcessorCount - 1
+                        ErrorAction = 'Stop'
                     }
-                } catch {
-                    Add-StepResult -Step $currentStep `
-                                  -Component $name `
-                                  -Message ("Failed to configure: {0}" -f $_.Exception.Message) `
-                                  -Type 'Warning'
+                    Set-NetAdapterRss @rssParams
+                    Write-Success "Enabled RSS on $($adapter.Name)"
                 }
+            } catch {
+                Write-DebugLog "RSS not available on $($adapter.Name): $($_.Exception.Message)"
+            }
+
+            # Try to enable VMQ if supported
+            try {
+                # Check if VMQ is supported before attempting to get/set
+                $vmqSupported = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
+                              Where-Object { $_.RegistryKeyword -like "*VMQ*" -or $_.DisplayName -like "*Virtual Machine Queue*" }
+
+                if ($vmqSupported) {
+                    Enable-NetAdapterVmq -Name $adapter.Name -ErrorAction Stop
+                    Write-Success "Enabled VMQ on $($adapter.Name)"
+                }
+            } catch {
+                Write-DebugLog "VMQ not available on $($adapter.Name): $($_.Exception.Message)"
+            }
+
+            # Try to enable QoS if supported
+            try {
+                # Check if QoS is supported before attempting to get/set
+                $qosSupported = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
+                              Where-Object { $_.RegistryKeyword -like "*QoS*" -or $_.DisplayName -like "*Quality of Service*" }
+
+                if ($qosSupported) {
+                    Enable-NetAdapterQos -Name $adapter.Name -ErrorAction Stop
+                    Write-Success "Enabled QoS on $($adapter.Name)"
+                }
+            } catch {
+                Write-DebugLog "QoS not available on $($adapter.Name): $($_.Exception.Message)"
             }
         }
+
+        # Configure modern SMB settings
+        try {
+            # Get current SMB configuration
+            $smbConfig = Get-SmbServerConfiguration -ErrorAction Stop
+
+            # Only update if needed
+            if (-not $smbConfig.EnableMultiChannel -or
+                $smbConfig.Smb2CreditsMin -ne 512 -or
+                $smbConfig.Smb2CreditsMax -ne 8192) {
+
+                Set-SmbServerConfiguration -EnableMultiChannel $true `
+                                        -Smb2CreditsMin 512 `
+                                        -Smb2CreditsMax 8192 `
+                                        -Force `
+                                        -ErrorAction Stop
+                Write-Success "Configured SMB optimization settings"
+            } else {
+                Write-CustomWarning "SMB settings already optimized"
+            }
+        } catch {
+            Write-CustomWarning "Unable to configure SMB settings: $($_.Exception.Message)"
+        }
+
     } catch {
         Add-StepResult -Step $currentStep `
                       -Component "Network Optimization" `
-                      -Message ("Failed to optimize network: {0}" -f $_.Exception.Message) `
-                      -Type 'Critical'
+                      -Message ("Failed: {0}" -f $_.Exception.Message) `
+                      -Type 'Warning'
     }
 }
 
@@ -898,43 +961,74 @@ function Enable-WindowsFeatures {
     Write-SubStep "Configuring Windows features..."
 
     try {
-        # Use DISM instead of PowerShell commands
+        $dism = "$env:SystemRoot\System32\dism.exe"
+
+        # Define required features
         $features = @(
             'NetFx3',
-            'SMB1Protocol',
-            'SmbDirect',
-            'Microsoft-Windows-GroupPolicy-ClientTools-Package'
+            'SmbDirect'
         )
 
+        # First check if any features need to be enabled
+        $needsUpdate = $false
         foreach ($feature in $features) {
-            Write-SubStep "Enabling feature: $feature"
-
-            # Check if feature exists first
-            $checkResult = cmd /c "DISM /Online /Get-FeatureInfo /FeatureName:$feature" 2>&1
+            $result = & $dism /Online /Get-FeatureInfo /FeatureName:$feature 2>&1
             if ($LASTEXITCODE -eq 0) {
-                $result = cmd /c "DISM /Online /Enable-Feature /FeatureName:$feature /Quiet /NoRestart" 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Add-StepResult -Step $currentStep `
-                                 -Component $feature `
-                                 -Message "Failed to enable: $result" `
-                                 -Type 'Warning'
+                if ($result -match "State : Disabled") {
+                    $needsUpdate = $true
+                    break
                 }
-            } else {
-                Add-StepResult -Step $currentStep `
-                             -Component $feature `
-                             -Message "Feature not available on this system" `
-                             -Type 'Warning'
             }
         }
 
-        return $true
+        # Only proceed if updates are needed
+        if ($needsUpdate) {
+            foreach ($feature in $features) {
+                Write-SubStep "Enabling feature: $feature"
+                $result = & $dism /Online /Enable-Feature /FeatureName:$feature /Quiet /NoRestart 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Add-StepResult -Step $currentStep `
+                                 -Component $feature `
+                                 -Message "Failed to enable" `
+                                 -Type 'Warning'
+                }
+            }
+        } else {
+            Write-SubStep "All required features are already enabled"
+        }
+
+        # Configure SMB versions
+        Write-SubStep "Configuring SMB protocol versions..."
+
+        # Disable SMB1
+        & $dism /Online /Disable-Feature /FeatureName:SMB1Protocol /Quiet /NoRestart 2>&1
+
+        # Enable SMB2/3 via registry
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+
+        # Enable SMB2
+        Set-ItemProperty -Path $regPath -Name "SMB2" -Value 1 -Type DWord -Force
+
+        # Enable SMB3
+        Set-ItemProperty -Path $regPath -Name "EnableSMB2Protocol" -Value 1 -Type DWord -Force
+
+        # Set minimum SMB version to SMB2
+        Set-ItemProperty -Path $regPath -Name "SMB1" -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $regPath -Name "SMB2_02" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $regPath -Name "SMB2_10" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $regPath -Name "SMB2_22" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $regPath -Name "SMB2_24" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $regPath -Name "SMB3" -Value 1 -Type DWord -Force
+
+        Write-Success "SMB protocol versions configured successfully"
+        return
     }
     catch {
         Add-StepResult -Step $currentStep `
                       -Component "Feature Management" `
-                      -Message ("Failed to configure Windows features: {0}" -f $_.Exception.Message) `
+                      -Message ("Failed: {0}" -f $_.Exception.Message) `
                       -Type 'Warning'
-        return $false
+        return $false | Out-Null  # Suppress output
     }
 }
 
@@ -1380,9 +1474,51 @@ function Initialize-WindowsInfo {
             return $false
         }
 
+        # Check for pending reboots
+        $pendingReboot = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations"
+        ) | Where-Object { Test-Path $_ }
+
+        if ($pendingReboot) {
+            Write-Warning "System has pending reboot. Please restart before running this script."
+            return $false
+        }
+
+        # Check for Windows Defender exclusions
+        $defenderRunning = Get-Service -Name "WinDefend" -ErrorAction SilentlyContinue
+        if ($defenderRunning.Status -eq 'Running') {
+            Write-SubStep "Checking Windows Defender configuration..."
+            $networkPaths = @(
+                "%SystemRoot%\System32\drivers\etc\hosts",
+                "%SystemRoot%\System32\svchost.exe",
+                "%SystemRoot%\System32\netsh.exe"
+            )
+
+            foreach ($path in $networkPaths) {
+                Add-MpPreference -ExclusionPath $path -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Check for required Windows capabilities
+        $requiredCapabilities = @(
+            "NetFx3~~~~",
+            "DirectPlay~~~~",
+            "Windows-Defender-Default-Definitions~~~~0.0.0.0"
+        )
+
+        foreach ($capability in $requiredCapabilities) {
+            $state = Get-WindowsCapability -Online | Where-Object { $_.Name -like $capability }
+            if ($state.State -ne "Installed") {
+                Write-SubStep "Installing required capability: $capability"
+                Add-WindowsCapability -Online -Name $capability
+            }
+        }
+
         return $true
     } catch {
-        Write-Error "Failed to determine Windows version"
+        Write-Error "Failed to initialize Windows configuration: $($_.Exception.Message)"
         return $false
     }
 }
@@ -1397,10 +1533,14 @@ function Set-ServiceConfig {
     )
 
     try {
-        # Try using sc.exe first
-        $result = cmd /c "sc.exe config $ServiceName start= $($StartupType.ToLower())" 2>&1
+        # Try using sc.exe with full paths
+        $sc = "$env:SystemRoot\System32\sc.exe"
+        $net = "$env:SystemRoot\System32\net.exe"
+
+        # Configure startup type
+        $result = & $sc config $ServiceName start= $($StartupType.ToLower()) 2>&1
         if ($LASTEXITCODE -ne 0) {
-            # If sc.exe fails, try using reg.exe
+            # If sc.exe fails, try direct registry modification
             $regPath = "HKLM\System\CurrentControlSet\Services\$ServiceName"
             $startValue = switch ($StartupType.ToLower()) {
                 'automatic' { 2 }
@@ -1408,16 +1548,12 @@ function Set-ServiceConfig {
                 'disabled' { 4 }
                 default { 2 }
             }
-            $result = cmd /c "reg.exe add `"$regPath`" /v Start /t REG_DWORD /d $startValue /f" 2>&1
+            & reg.exe add $regPath /v Start /t REG_DWORD /d $startValue /f | Out-Null
         }
 
         if ($Start) {
-            # Try net start first
-            $result = cmd /c "net start $ServiceName" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                # If net start fails, try sc.exe start
-                $result = cmd /c "sc.exe start $ServiceName" 2>&1
-            }
+            # Try to start the service
+            & $net start $ServiceName 2>&1 | Out-Null
         }
 
         return $true
