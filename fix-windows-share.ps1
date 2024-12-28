@@ -631,40 +631,12 @@ function Enable-RequiredProtocols {
         )
 
         foreach ($component in $components) {
-            try {
-                # Check if binding exists and its current state
-                $binding = Get-NetAdapterBinding -Name $adapter.Name -ComponentID $component.ID -ErrorAction SilentlyContinue
-                if ($null -ne $binding) {
-                    if (-not $binding.Enabled) {
-                        Write-SubStep "Enabling $($component.Name) on adapter (currently disabled)"
-                        Enable-NetAdapterBinding -Name $adapter.Name -ComponentID $component.ID -ErrorAction Stop
-                        Write-Success "Enabled $($component.Name) on adapter"
-                    } else {
-                        Write-CustomWarning "$($component.Name) already enabled on adapter"
-                    }
-                } else {
-                    Write-CustomWarning "$($component.Name) not available on adapter $($adapter.Name)"
-                }
-            } catch {
-                Write-CustomWarning "Failed to configure $($component.Name) on adapter $($adapter.Name): $($_.Exception.Message)"
+            if (-not (Set-NetworkBinding -AdapterName $adapter.Name -ComponentID $component.ID -DisplayName $component.Name -Enable $true)) {
+                Add-StepResult -Step $currentStep `
+                              -Component $component.Name `
+                              -Message "Failed to configure on adapter $($adapter.Name)" `
+                              -Type 'Warning'
             }
-        }
-
-        # Check and optimize TCP/IP settings
-        try {
-            $tcpipBinding = Get-NetAdapterBinding -Name $adapter.Name -ComponentID ms_tcpip -ErrorAction SilentlyContinue
-            if ($null -ne $tcpipBinding) {
-                $ipInterface = Get-NetIPInterface -InterfaceAlias $adapter.Name -AddressFamily IPv4
-                if ($ipInterface -and $ipInterface.RouterDiscovery -ne 'Enabled') {
-                    Write-SubStep "Optimizing TCP/IP settings for adapter"
-                    Set-NetIPInterface -InterfaceAlias $adapter.Name -AddressFamily IPv4 -RouterDiscovery Enabled
-                    Write-Success "Updated TCP/IP settings for adapter"
-                } else {
-                    Write-CustomWarning "TCP/IP settings already optimized for adapter"
-                }
-            }
-        } catch {
-            Write-CustomWarning "Failed to optimize TCP/IP settings for adapter $($adapter.Name): $($_.Exception.Message)"
         }
     }
 }
@@ -1400,6 +1372,169 @@ function Initialize-WindowsInfo {
     } catch {
         Write-Error "Failed to determine Windows version"
         return $false
+    }
+}
+
+# Add error handling for service configuration
+function Set-ServiceConfig {
+    param(
+        [string]$ServiceName,
+        [string]$DisplayName,
+        [string]$StartupType = 'Automatic',
+        [bool]$Start = $true
+    )
+
+    try {
+        $service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+        # Try to modify service using sc.exe instead of Set-Service
+        if ($service.StartType -ne $StartupType) {
+            $result = cmd /c "sc.exe config $ServiceName start= $($StartupType.ToLower())" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-CustomWarning "Service '$DisplayName' cannot be configured: $result"
+                return $false
+            }
+        }
+
+        if ($Start -and $service.Status -ne 'Running') {
+            $result = cmd /c "net start $ServiceName" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-CustomWarning "Service '$DisplayName' cannot be started: $result"
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        Write-CustomWarning "Service '$DisplayName' configuration failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Fix network adapter binding issues
+function Set-NetworkBinding {
+    param(
+        [string]$AdapterName,
+        [string]$ComponentID,
+        [string]$DisplayName,
+        [bool]$Enable = $true
+    )
+
+    try {
+        # Use netsh instead of Get-NetAdapterBinding
+        if ($Enable) {
+            $result = cmd /c "netsh interface ipv4 set interface `"$AdapterName`" component=$ComponentID enable" 2>&1
+        } else {
+            $result = cmd /c "netsh interface ipv4 set interface `"$AdapterName`" component=$ComponentID disable" 2>&1
+        }
+
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+
+        Write-CustomWarning ("Failed to configure {0} on adapter {1}" -f $DisplayName, $AdapterName)
+        return $false
+    }
+    catch {
+        Write-CustomWarning ("Error configuring {0}: {1}" -f $DisplayName, $_.Exception.Message)
+        return $false
+    }
+}
+
+# Fix DNS registration issues
+function Register-DNSAddress {
+    try {
+        # Use ipconfig directly instead of Register-DnsClient
+        $result = cmd /c "ipconfig /registerdns" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+        Write-CustomWarning "DNS registration failed: $result"
+        return $false
+    }
+    catch {
+        Write-CustomWarning "DNS registration error: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Fix SMB configuration issues
+function Set-SMBConfig {
+    param(
+        [int]$MaxChannels = 32,
+        [int]$CreditsMin = 512,
+        [int]$CreditsMax = 8192
+    )
+
+    try {
+        # Use PowerShell commands with error handling
+        $null = Set-SmbServerConfiguration -EnableMultiChannel $true -Force -ErrorAction Stop
+        $null = Set-SmbServerConfiguration -Smb2CreditsMin $CreditsMin -Smb2CreditsMax $CreditsMax -Force -ErrorAction Stop
+        $null = Set-SmbServerConfiguration -ServerHidden $false -AnnounceServer $true -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-CustomWarning "SMB configuration error: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Update Enable-RequiredServices function
+function Enable-RequiredServices {
+    [CmdletBinding()]
+    param()
+
+    $currentStep = "Required Services"
+    Write-SubStep "Configuring required services..."
+
+    foreach ($service in $services) {
+        Write-SubStep "Configuring: $($service.DisplayName)"
+
+        # Skip services based on Windows edition
+        if ($script:WindowsInfo.IsHome -and $editionConfig.Home.SkipServices -contains $service.Name) {
+            Write-CustomWarning "Skipping $($service.DisplayName) (not required for Home edition)"
+            continue
+        }
+
+        if (-not (Set-ServiceConfig -ServiceName $service.Name -DisplayName $service.DisplayName)) {
+            Add-StepResult -Step $currentStep `
+                          -Component $service.DisplayName `
+                          -Message "Failed to configure service" `
+                          -Type 'Warning'
+        }
+    }
+}
+
+function Enable-FileSharing {
+    [CmdletBinding()]
+    param()
+
+    $currentStep = "File Sharing"
+    Write-SubStep "Configuring File and Printer Sharing..."
+
+    try {
+        # Configure SMB settings
+        if (-not (Set-SMBConfig)) {
+            Add-StepResult -Step $currentStep `
+                          -Component "SMB Configuration" `
+                          -Message "Failed to configure SMB settings" `
+                          -Type 'Warning'
+        }
+
+        # Configure DNS registration
+        if (-not (Register-DNSAddress)) {
+            Add-StepResult -Step $currentStep `
+                          -Component "DNS Registration" `
+                          -Message "Failed to register DNS addresses" `
+                          -Type 'Warning'
+        }
+    }
+    catch {
+        Add-StepResult -Step $currentStep `
+                      -Component "File and Printer Sharing" `
+                      -Message ("Failed to configure: {0}" -f $_.Exception.Message) `
+                      -Type 'Critical'
     }
 }
 
